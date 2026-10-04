@@ -1,0 +1,115 @@
+# .github/workflows/strata-build.yml
+# Polls Niko1221/Strata for a new release tag, builds the upstream image, adds this repo's
+# non-root layer (Dockerfile), pushes to GHCR, and commits the tag to UPSTREAM_TAG.
+name: Build Strata
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"        # every 4 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if the tag is unchanged"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                  # commit UPSTREAM_TAG
+  packages: write                  # push to ghcr.io
+
+concurrency:
+  group: strata-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/Niko1221/Strata.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest upstream tag
+        id: tag
+        run: |
+          latest=$(git ls-remote --tags --refs --sort=-v:refname "$UPSTREAM" 'v*' | head -1 | sed 's|.*refs/tags/||')
+          current=$(cat UPSTREAM_TAG 2>/dev/null || true)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ -z "$latest" ]; then echo "No upstream tag found"; exit 1; fi
+          if [ "$latest" != "$current" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "current=$current latest=$latest"
+          # GHCR image names must be lowercase
+          echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')/strata" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk (CUDA devel base is large)
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Log in to GHCR
+        if: steps.tag.outputs.build == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Upstream builds ggml with -march=native (STRATA_PORTABLE defaults OFF). GitHub runners
+      # often have AVX-512, which would SIGILL on AVX2-only hosts (e.g. EPYC Zen 3). Patch the
+      # upstream Dockerfile to build for an AVX2 baseline; Strata's own AVX-512 kernels are
+      # compiled per file and chosen at run time, so they still work where supported.
+      - name: Fetch and patch upstream for a portable CPU build
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          git clone --depth 1 --branch "${{ steps.tag.outputs.latest }}" "$UPSTREAM" "$RUNNER_TEMP/upstream"
+          cd "$RUNNER_TEMP/upstream"
+          sed -i 's|"-DSTRATA_ENABLE_CUDA=ON",|"-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_PORTABLE=ON",|' Dockerfile
+          sed -i 's|"-DSTRATA_VISION_CUDA=ON",|"-DSTRATA_VISION_CUDA=ON", "-DGGML_NATIVE=OFF", "-DGGML_AVX2=ON", "-DGGML_FMA=ON", "-DGGML_F16C=ON",|' Dockerfile
+          # Fail loudly if upstream changed the Dockerfile and the patch no longer applies
+          grep -q -- '-DSTRATA_PORTABLE=ON' Dockerfile || { echo "engine patch did not apply"; exit 1; }
+          grep -q -- '-DGGML_NATIVE=OFF' Dockerfile   || { echo "vision patch did not apply"; exit 1; }
+
+      # Plain docker build (local image store), so the second build can use the first as its base.
+      - name: Build upstream image
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          docker build --pull --no-cache \
+            --build-arg CUDA_ARCHITECTURES=86 \
+            -t strata-upstream:latest \
+            "$RUNNER_TEMP/upstream"
+
+      - name: Add non-root layer
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          docker build --no-cache \
+            --build-arg BASE=strata-upstream:latest \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.version=${{ steps.tag.outputs.latest }} \
+            -t "${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.latest }}" \
+            -t "${{ steps.tag.outputs.image }}:latest" \
+            .
+
+      - name: Smoke test as non-root
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          docker run --rm --user 2000:2000 --entrypoint /bin/sh \
+            "${{ steps.tag.outputs.image }}:latest" -c \
+            'touch /opt/strata/.venv/.write-test && mkdir -p "$HOME/.config" && echo ok'
+
+      - name: Push
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          docker push "${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.latest }}"
+          docker push "${{ steps.tag.outputs.image }}:latest"
+
+      - name: Commit UPSTREAM_TAG
+        if: steps.tag.outputs.build == 'true'
+        run: |
+          echo "${{ steps.tag.outputs.latest }}" > UPSTREAM_TAG
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add UPSTREAM_TAG
+          git commit -m "Build Strata ${{ steps.tag.outputs.latest }}"
+          git push
